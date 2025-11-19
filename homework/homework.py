@@ -96,3 +96,155 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+# Paso 1 — Lectura y limpieza de los datos
+
+train_pd = pd.read_csv("files/input/train_data.csv.zip", compression="zip").copy()
+test_pd = pd.read_csv("files/input/test_data.csv.zip", compression="zip").copy()
+
+train_pd.rename(columns={"default payment next month": "default"}, inplace=True)
+test_pd.rename(columns={"default payment next month": "default"}, inplace=True)
+
+if "ID" in train_pd.columns:
+    train_pd.drop(columns=["ID"], inplace=True)
+if "ID" in test_pd.columns:
+    test_pd.drop(columns=["ID"], inplace=True)
+
+train_pd = train_pd[(train_pd["MARRIAGE"] != 0) & (train_pd["EDUCATION"] != 0)]
+test_pd = test_pd[(test_pd["MARRIAGE"] != 0) & (test_pd["EDUCATION"] != 0)]
+
+train_pd.loc[train_pd["EDUCATION"] >= 4, "EDUCATION"] = 4
+test_pd.loc[test_pd["EDUCATION"] >= 4, "EDUCATION"] = 4
+
+train_pd.dropna(inplace=True)
+test_pd.dropna(inplace=True)
+
+# Paso 2 — Separar X y y
+
+X_train = train_pd.drop(columns=["default"])
+y_train = train_pd["default"]
+
+X_test = test_pd.drop(columns=["default"])
+y_test = test_pd["default"]
+
+# Paso 3 — Pipeline (OHE + STD + PCA + KBest + MLP)
+
+cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+num_cols = [c for c in X_train.columns if c not in cat_cols]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(), cat_cols),
+        ("num", StandardScaler(), num_cols),
+    ]
+)
+
+pipe = Pipeline(
+    steps=[
+        ("prep", preprocessor),
+        ("selector", SelectKBest(score_func=f_classif)),
+        ("pca", PCA()),
+        ("mlp", MLPClassifier(max_iter=15000, random_state=21)),
+    ]
+)
+
+# Paso 4 — GridSearchCV (hiperparámetros)
+
+param_grid = {
+    "selector__k": [20],
+    "pca__n_components": [None],
+    "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+    "mlp__alpha": [0.26],
+    "mlp__learning_rate_init": [0.001],
+}
+
+grid = GridSearchCV(
+    estimator=pipe,
+    param_grid=param_grid,
+    cv=10,
+    scoring="balanced_accuracy",
+    n_jobs=-1,
+    refit=True,
+)
+
+grid.fit(X_train, y_train)
+
+# Paso 5 — Guardar el modelo comprimido
+
+os.makedirs("files/models", exist_ok=True)
+
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid, f)
+
+# Paso 6 — Métricas (train y test)
+
+y_pred_train = grid.predict(X_train)
+y_pred_test = grid.predict(X_test)
+
+train_metrics = {
+    "type": "metrics",
+    "dataset": "train",
+    "precision": precision_score(y_train, y_pred_train, zero_division=0),
+    "balanced_accuracy": balanced_accuracy_score(y_train, y_pred_train),
+    "recall": recall_score(y_train, y_pred_train, zero_division=0),
+    "f1_score": f1_score(y_train, y_pred_train, zero_division=0),
+}
+
+test_metrics = {
+    "type": "metrics",
+    "dataset": "test",
+    "precision": precision_score(y_test, y_pred_test, zero_division=0),
+    "balanced_accuracy": balanced_accuracy_score(y_test, y_pred_test),
+    "recall": recall_score(y_test, y_pred_test, zero_division=0),
+    "f1_score": f1_score(y_test, y_pred_test, zero_division=0),
+}
+
+# Paso 7 — Matrices de confusión
+
+tn, fp, fn, tp = confusion_matrix(y_train, y_pred_train).ravel()
+cm_train = {
+    "type": "cm_matrix",
+    "dataset": "train",
+    "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+    "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+}
+
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_test).ravel()
+cm_test = {
+    "type": "cm_matrix",
+    "dataset": "test",
+    "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+    "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+}
+
+# Guardar todo en metrics.json
+
+Path("files/output").mkdir(parents=True, exist_ok=True)
+
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    f.write(json.dumps(train_metrics) + "\n")
+    f.write(json.dumps(test_metrics) + "\n")
+    f.write(json.dumps(cm_train) + "\n")
+    f.write(json.dumps(cm_test) + "\n")
